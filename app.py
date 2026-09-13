@@ -1,353 +1,515 @@
-"""Локальный веб-интерфейс для сравнения температур через DeepSeek API."""
+"""Flask API для многодиалогового DeepSeek Agent."""
 
 from __future__ import annotations
 
-import html
 import json
 import os
-import re
-import time
 import uuid
-from dataclasses import dataclass
-from datetime import datetime
+from copy import deepcopy
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template, request, send_from_directory, url_for
-from openai import OpenAI
+from flask import Flask, jsonify, render_template, request, send_file
+
+from agent import (
+    DEEPSEEK_MODELS,
+    PROVIDER_CAPABILITIES,
+    Agent,
+    AgentSettings,
+    DeepSeekProvider,
+    dialogue_token_totals,
+    normalize_token_usage,
+)
+from context_manager import (
+    active_path_messages,
+    add_fact,
+    append_tree_message,
+    begin_branch,
+    branch_points,
+    delete_fact,
+    edit_fact,
+    ensure_context_management,
+    facts_token_totals,
+    request_history,
+    select_branch,
+    set_context_mode,
+    set_window_sizes,
+    summary_token_totals,
+    update_sticky_facts,
+    update_summaries,
+)
+from presets import PresetManager
+from storage import JsonStorage, now_iso
+from voice import WhisperService
+
 
 BASE_DIR = Path(__file__).resolve().parent
-SAVED_RUNS_DIR = BASE_DIR / "saved_runs"
 load_dotenv(BASE_DIR / ".env")
-
-app = Flask(__name__)
-app.json.ensure_ascii = False
-
-DEFAULT_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
-MAX_TASK_LENGTH = 20_000
-MAX_ANSWER_LENGTH = 50_000
-RUN_ID_PATTERN = re.compile(r"^[0-9A-Za-z_-]+$")
+MAX_MESSAGE_LENGTH = 50_000
 
 
-@dataclass
-class CompletionResult:
-    answer: str
-    model: str
-    usage: dict[str, int]
-    elapsed_seconds: float
+def create_app(
+    data_dir: Path | None = None,
+    agent_instance: Agent | None = None,
+    voice_service: WhisperService | None = None,
+) -> Flask:
+    flask_app = Flask(__name__)
+    flask_app.json.ensure_ascii = False
+    flask_app.config["MAX_CONTENT_LENGTH"] = 26 * 1024 * 1024
+    storage = JsonStorage(data_dir or BASE_DIR / "data")
+    preset_manager = PresetManager(storage)
+    chat_agent = agent_instance or Agent(DeepSeekProvider())
+    whisper = voice_service or WhisperService(BASE_DIR, autostart=data_dir is None)
 
+    flask_app.extensions["json_storage"] = storage
+    flask_app.extensions["preset_manager"] = preset_manager
+    flask_app.extensions["chat_agent"] = chat_agent
+    flask_app.extensions["whisper_service"] = whisper
 
-def get_client() -> OpenAI:
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "Не найден DEEPSEEK_API_KEY. Добавьте ключ в файл .env и перезапустите программу."
+    @flask_app.get("/")
+    def index():
+        return render_template("index.html")
+
+    @flask_app.get("/api/state")
+    def state():
+        default_model = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+        if default_model not in DEEPSEEK_MODELS:
+            default_model = "deepseek-v4-flash"
+        return jsonify({
+            "ok": True,
+            "provider": PROVIDER_CAPABILITIES,
+            "default_settings": AgentSettings(model=default_model).to_dict(),
+            "conversations": storage.list_conversations(),
+            "presets": preset_manager.list(),
+        })
+
+    @flask_app.get("/api/voice/status")
+    def voice_status():
+        return jsonify({"ok": True, "voice": whisper.status()})
+
+    @flask_app.post("/api/voice/start")
+    def voice_start():
+        whisper.start()
+        return jsonify({"ok": True, "voice": whisper.status()}), 202
+
+    @flask_app.post("/api/voice/transcribe")
+    def voice_transcribe():
+        uploaded = request.files.get("audio")
+        if uploaded is None:
+            return api_error("Аудиозапись не передана.", 400)
+        try:
+            result = whisper.transcribe(
+                uploaded.read(),
+                uploaded.filename or "recording.webm",
+                uploaded.mimetype or "application/octet-stream",
+            )
+            return jsonify({"ok": True, **result})
+        except ValueError as error:
+            return api_error(str(error), 400)
+        except RuntimeError as error:
+            return api_error(str(error), 503)
+
+    @flask_app.post("/api/conversations")
+    def create_conversation():
+        try:
+            conversation = storage.create_conversation(json_body().get("title", "Новый диалог"))
+            return jsonify({"ok": True, "conversation": with_token_totals(conversation)}), 201
+        except ValueError as error:
+            return api_error(str(error), 400)
+
+    @flask_app.get("/api/conversations/<conversation_id>")
+    def get_conversation(conversation_id: str):
+        try:
+            return jsonify({"ok": True, "conversation": with_token_totals(storage.get_conversation(conversation_id))})
+        except (ValueError, FileNotFoundError):
+            return api_error("Диалог не найден.", 404)
+
+    @flask_app.patch("/api/conversations/<conversation_id>")
+    def rename_conversation(conversation_id: str):
+        try:
+            conversation = storage.rename_conversation(conversation_id, json_body().get("title", ""))
+            return jsonify({"ok": True, "conversation": with_token_totals(conversation)})
+        except FileNotFoundError:
+            return api_error("Диалог не найден.", 404)
+        except ValueError as error:
+            return api_error(str(error), 400)
+
+    @flask_app.patch("/api/conversations/<conversation_id>/context")
+    def update_conversation_context(conversation_id: str):
+        try:
+            conversation = storage.get_conversation(conversation_id)
+            previous_mode = ensure_context_management(conversation)["mode"]
+            data = json_body()
+            mode = data.get("mode")
+            set_context_mode(conversation, mode)
+            set_window_sizes(
+                conversation,
+                sliding=data.get("sliding_window_exchanges"),
+                facts=data.get("facts_window_exchanges"),
+            )
+            if previous_mode != mode:
+                labels = {
+                    "full": "Полная история",
+                    "summary": "Summary + последние обмены",
+                    "sliding": "Sliding Window",
+                    "facts": "Sticky Facts",
+                    "branching": "Branching",
+                }
+                conversation["messages"].append({
+                    "id": uuid.uuid4().hex,
+                    "role": "event",
+                    "parent_id": conversation["context_management"].get("active_leaf_id"),
+                    "content": f"Режим контекста: {labels[mode]}.",
+                    "created_at": now_iso(),
+                })
+            conversation = storage.save_conversation(conversation)
+            return jsonify({"ok": True, "conversation": with_token_totals(conversation)})
+        except FileNotFoundError:
+            return api_error("Диалог не найден.", 404)
+        except ValueError as error:
+            return api_error(str(error), 400)
+
+    @flask_app.delete("/api/conversations/<conversation_id>")
+    def delete_conversation(conversation_id: str):
+        try:
+            storage.delete_conversation(conversation_id)
+            return jsonify({"ok": True})
+        except (ValueError, FileNotFoundError):
+            return api_error("Диалог не найден.", 404)
+
+    @flask_app.post("/api/conversations/<conversation_id>/messages")
+    def send_message(conversation_id: str):
+        try:
+            data = json_body()
+            content = require_message(data.get("content"))
+            settings = AgentSettings.from_dict(data.get("settings"))
+            source = configuration_source(data.get("preset_id"), settings, preset_manager)
+            conversation = storage.get_conversation(conversation_id)
+        except FileNotFoundError:
+            return api_error("Диалог не найден.", 404)
+        except (ValueError, KeyError) as error:
+            return api_error(str(error).strip("'"), 400)
+
+        exchange_id = uuid.uuid4().hex
+        created_at = now_iso()
+        settings_snapshot = settings.to_dict()
+        ensure_context_management(conversation)
+        previous_source = last_configuration(active_path_messages(conversation))
+        if previous_source is not None and (
+            previous_source.get("settings") != settings_snapshot
+            or previous_source.get("configuration_source") != source
+        ):
+            conversation["messages"].append({
+                "id": uuid.uuid4().hex,
+                "role": "event",
+                "parent_id": conversation["context_management"].get("active_leaf_id"),
+                "content": configuration_event_text(source),
+                "created_at": created_at,
+            })
+
+        user_message = {
+            "id": uuid.uuid4().hex,
+            "exchange_id": exchange_id,
+            "role": "user",
+            "content": content,
+            "created_at": created_at,
+            "technical": {
+                "request_status": "pending",
+                "configuration_source": source,
+                "settings": settings_snapshot,
+            },
+        }
+        append_tree_message(conversation, user_message)
+        if conversation.get("title") == "Новый диалог":
+            conversation["title"] = content.replace("\n", " ")[:60]
+        conversation = storage.save_conversation(conversation)
+
+        try:
+            update_sticky_facts(conversation, chat_agent, content)
+            update_summaries(conversation, chat_agent)
+            history_for_request, active_summary_text, active_facts, context_snapshot = request_history(conversation)
+            conversation = storage.save_conversation(conversation)
+            result = chat_agent.reply(
+                history_for_request,
+                content,
+                settings,
+                summary=active_summary_text,
+                facts=active_facts,
+            )
+            usage = normalize_token_usage(result.technical.get("usage"))
+            for message in conversation["messages"]:
+                if message.get("id") == user_message["id"]:
+                    message["technical"].update({
+                        "request_status": "completed",
+                        "token_usage": {
+                            "context_tokens": usage["input_tokens"],
+                            "cached_context_tokens": usage["cached_input_tokens"],
+                            "uncached_context_tokens": usage["uncached_input_tokens"],
+                        },
+                        "context_management": context_snapshot,
+                    })
+                    break
+            assistant_message = {
+                "id": uuid.uuid4().hex,
+                "exchange_id": exchange_id,
+                "role": "assistant",
+                "content": result.content,
+                "reasoning_content": result.reasoning_content,
+                "created_at": now_iso(),
+                "technical": {
+                    **result.technical,
+                    "request_status": "completed",
+                    "configuration_source": source,
+                    "settings": settings_snapshot,
+                    "context_management": context_snapshot,
+                },
+            }
+            append_tree_message(conversation, assistant_message, parent_id=user_message["id"])
+            totals = dialogue_token_totals(conversation["messages"])
+            conversation["token_totals"] = totals
+            assistant_message["technical"]["dialogue_totals"] = totals
+            conversation = storage.save_conversation(conversation)
+            return jsonify({"ok": True, "conversation": with_token_totals(conversation)})
+        except Exception as error:
+            flask_app.logger.exception("Ошибка DeepSeek API")
+            message = friendly_api_error(error)
+            for item in conversation["messages"]:
+                if item.get("id") == user_message["id"]:
+                    item["technical"].update({"request_status": "failed", "error": message})
+                    break
+            conversation = storage.save_conversation(conversation)
+            return jsonify({"ok": False, "error": message, "conversation": with_token_totals(conversation)}), 502
+
+    @flask_app.get("/api/conversations/<conversation_id>/export")
+    def export_conversation(conversation_id: str):
+        try:
+            bundle = storage.export_bundle(conversation_id)
+            bundle["conversation"] = with_token_totals(bundle["conversation"])
+        except (ValueError, FileNotFoundError):
+            return api_error("Диалог не найден.", 404)
+        payload = json.dumps(bundle, ensure_ascii=False, indent=2).encode("utf-8")
+        return send_file(
+            BytesIO(payload),
+            mimetype="application/json; charset=utf-8",
+            as_attachment=True,
+            download_name=f"deepseek-dialog-{conversation_id[:8]}.json",
         )
-    return OpenAI(
-        api_key=api_key,
-        base_url="https://api.deepseek.com",
-        timeout=180.0,
-        max_retries=1,
-    )
+
+    @flask_app.post("/api/conversations/<conversation_id>/branches")
+    def create_branch(conversation_id: str):
+        """Начинает ветку после сообщения; после user сразу генерирует новый ответ."""
+        try:
+            conversation = storage.get_conversation(conversation_id)
+            if ensure_context_management(conversation)["mode"] != "branching":
+                raise ValueError("Сначала выберите стратегию Branching.")
+            checkpoint = begin_branch(conversation, json_body().get("checkpoint_id"))
+            if checkpoint["role"] == "assistant":
+                conversation = storage.save_conversation(conversation)
+                return jsonify({"ok": True, "conversation": with_token_totals(conversation)}), 201
+
+            technical = checkpoint.get("technical", {})
+            settings = AgentSettings.from_dict(technical.get("settings"))
+            source = technical.get("configuration_source") or {
+                "type": "custom", "preset_id": None, "preset_name": None,
+            }
+            history, summary, facts, snapshot = request_history(conversation)
+            result = chat_agent.reply(
+                history,
+                checkpoint["content"],
+                settings,
+                summary=summary,
+                facts=facts,
+            )
+            assistant = {
+                "id": uuid.uuid4().hex,
+                "exchange_id": checkpoint.get("exchange_id"),
+                "role": "assistant",
+                "content": result.content,
+                "reasoning_content": result.reasoning_content,
+                "created_at": now_iso(),
+                "technical": {
+                    **result.technical,
+                    "request_status": "completed",
+                    "configuration_source": source,
+                    "settings": settings.to_dict(),
+                    "context_management": snapshot,
+                    "regenerated_from_checkpoint": checkpoint["id"],
+                },
+            }
+            append_tree_message(conversation, assistant, parent_id=checkpoint["id"])
+            conversation = storage.save_conversation(conversation)
+            return jsonify({"ok": True, "conversation": with_token_totals(conversation)}), 201
+        except FileNotFoundError:
+            return api_error("Диалог не найден.", 404)
+        except (ValueError, KeyError) as error:
+            return api_error(str(error).strip("'"), 400)
+        except Exception as error:
+            flask_app.logger.exception("Ошибка DeepSeek API при создании ветки")
+            return api_error(friendly_api_error(error), 502)
+
+    @flask_app.patch("/api/conversations/<conversation_id>/branches/active")
+    def change_active_branch(conversation_id: str):
+        try:
+            conversation = storage.get_conversation(conversation_id)
+            data = json_body()
+            select_branch(conversation, data.get("checkpoint_id"), data.get("child_id"))
+            conversation = storage.save_conversation(conversation)
+            return jsonify({"ok": True, "conversation": with_token_totals(conversation)})
+        except FileNotFoundError:
+            return api_error("Диалог не найден.", 404)
+        except ValueError as error:
+            return api_error(str(error), 400)
+
+    @flask_app.post("/api/conversations/<conversation_id>/facts")
+    def create_manual_fact(conversation_id: str):
+        try:
+            conversation = storage.get_conversation(conversation_id)
+            data = json_body()
+            fact = add_fact(conversation, data.get("key"), data.get("value"))
+            conversation = storage.save_conversation(conversation)
+            return jsonify({"ok": True, "fact": fact, "conversation": with_token_totals(conversation)}), 201
+        except FileNotFoundError:
+            return api_error("Диалог не найден.", 404)
+        except ValueError as error:
+            return api_error(str(error), 400)
+
+    @flask_app.put("/api/conversations/<conversation_id>/facts/<fact_id>")
+    def update_manual_fact(conversation_id: str, fact_id: str):
+        try:
+            conversation = storage.get_conversation(conversation_id)
+            data = json_body()
+            fact = edit_fact(conversation, fact_id, data.get("key"), data.get("value"), data.get("locked", True))
+            conversation = storage.save_conversation(conversation)
+            return jsonify({"ok": True, "fact": fact, "conversation": with_token_totals(conversation)})
+        except FileNotFoundError:
+            return api_error("Диалог не найден.", 404)
+        except KeyError:
+            return api_error("Факт не найден.", 404)
+        except ValueError as error:
+            return api_error(str(error), 400)
+
+    @flask_app.delete("/api/conversations/<conversation_id>/facts/<fact_id>")
+    def remove_manual_fact(conversation_id: str, fact_id: str):
+        try:
+            conversation = storage.get_conversation(conversation_id)
+            delete_fact(conversation, fact_id)
+            conversation = storage.save_conversation(conversation)
+            return jsonify({"ok": True, "conversation": with_token_totals(conversation)})
+        except FileNotFoundError:
+            return api_error("Диалог не найден.", 404)
+        except KeyError:
+            return api_error("Факт не найден.", 404)
+
+    @flask_app.post("/api/import")
+    def import_conversation():
+        try:
+            conversation = storage.import_bundle(json_body())
+            return jsonify({"ok": True, "conversation": with_token_totals(conversation)}), 201
+        except (ValueError, OSError, json.JSONDecodeError) as error:
+            return api_error(f"Не удалось импортировать файл: {error}", 400)
+
+    @flask_app.post("/api/presets")
+    def create_preset():
+        try:
+            return jsonify({"ok": True, "preset": preset_manager.create(json_body())}), 201
+        except ValueError as error:
+            return api_error(str(error), 400)
+
+    @flask_app.put("/api/presets/<preset_id>")
+    def update_preset(preset_id: str):
+        try:
+            return jsonify({"ok": True, "preset": preset_manager.update(preset_id, json_body())})
+        except KeyError:
+            return api_error("Пресет не найден.", 404)
+        except ValueError as error:
+            return api_error(str(error), 400)
+
+    @flask_app.delete("/api/presets/<preset_id>")
+    def delete_preset(preset_id: str):
+        try:
+            preset_manager.delete(preset_id)
+            return jsonify({"ok": True})
+        except KeyError:
+            return api_error("Пресет не найден.", 404)
+
+    return flask_app
 
 
-def require_temperature(value: Any) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError("Температура должна быть числом от 0 до 2.")
-    temperature = float(value)
-    if not 0 <= temperature <= 2:
-        raise ValueError("Температура должна находиться в диапазоне от 0 до 2.")
-    return temperature
-
-
-def call_model(messages: list[dict[str, str]], temperature: float) -> CompletionResult:
-    """Вызывает DeepSeek только в non-thinking режиме, где temperature действует."""
-    started = time.perf_counter()
-    response = get_client().chat.completions.create(
-        model=DEFAULT_MODEL,
-        messages=messages,
-        temperature=temperature,
-        extra_body={"thinking": {"type": "disabled"}},
-        stream=False,
-    )
-    elapsed = time.perf_counter() - started
-    message = response.choices[0].message
-    usage = response.usage
-
-    return CompletionResult(
-        answer=message.content or "(Модель не вернула текст ответа)",
-        model=response.model or DEFAULT_MODEL,
-        usage={
-            "input_tokens": usage.prompt_tokens if usage else 0,
-            "output_tokens": usage.completion_tokens if usage else 0,
-            "total_tokens": usage.total_tokens if usage else 0,
-        },
-        elapsed_seconds=elapsed,
-    )
-
-
-def result_to_dict(result: CompletionResult, temperature: float) -> dict[str, Any]:
-    return {
-        "answer": result.answer,
-        "model": result.model,
-        "usage": result.usage,
-        "elapsed_seconds": round(result.elapsed_seconds, 2),
-        "temperature": temperature,
-        "reasoning_enabled": False,
-    }
-
-
-def read_json_body() -> dict[str, Any]:
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
+def json_body() -> dict[str, Any]:
+    value = request.get_json(silent=True)
+    if not isinstance(value, dict):
         raise ValueError("Ожидался JSON-объект.")
-    return data
-
-
-def require_text(data: dict[str, Any], key: str, limit: int) -> str:
-    value = data.get(key)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"Поле «{key}» не должно быть пустым.")
-    value = value.strip()
-    if len(value) > limit:
-        raise ValueError(f"Поле «{key}» слишком длинное (максимум {limit} символов).")
     return value
 
 
-@app.get("/")
-def index():
-    return render_template("index.html", model=DEFAULT_MODEL)
+def require_message(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Введите сообщение.")
+    content = value.strip()
+    if len(content) > MAX_MESSAGE_LENGTH:
+        raise ValueError("Сообщение длиннее 50 000 символов.")
+    return content
 
 
-@app.post("/api/solve")
-def solve():
-    try:
-        data = read_json_body()
-        task = require_text(data, "task", MAX_TASK_LENGTH)
-        temperature = require_temperature(data.get("temperature"))
-        result = call_model([{"role": "user", "content": task}], temperature)
-        return jsonify({"ok": True, **result_to_dict(result, temperature)})
-    except ValueError as error:
-        return jsonify({"ok": False, "error": str(error)}), 400
-    except Exception as error:
-        app.logger.exception("Ошибка DeepSeek API")
-        return jsonify({"ok": False, "error": friendly_api_error(error)}), 502
+def configuration_source(preset_id: Any, settings: AgentSettings, manager: PresetManager) -> dict[str, Any]:
+    if not preset_id:
+        return {"type": "custom", "preset_id": None, "preset_name": None}
+    preset = manager.get(str(preset_id))
+    source_type = "preset" if preset["settings"] == settings.to_dict() else "preset_modified"
+    return {"type": source_type, "preset_id": preset["id"], "preset_name": preset["name"]}
 
 
-@app.post("/api/compare")
-def compare():
-    try:
-        data = read_json_body()
-        task = require_text(data, "task", MAX_TASK_LENGTH)
-        answers = data.get("answers")
-        if not isinstance(answers, list) or len(answers) != 3:
-            raise ValueError("Для сравнения нужна одна полная пачка из трёх ответов.")
-
-        formatted_answers = []
-        for index, item in enumerate(answers, start=1):
-            if not isinstance(item, dict):
-                raise ValueError("Неверный формат ответов для сравнения.")
-            temperature = require_temperature(item.get("temperature"))
-            answer = str(item.get("answer", "")).strip()[:MAX_ANSWER_LENGTH]
-            if not answer:
-                raise ValueError(f"Ответ {index} пуст.")
-            formatted_answers.append(
-                f"### Ответ {index} — temperature = {temperature:g}\n{answer}"
-            )
-
-        judge_prompt = (
-            "Ты независимый проверяющий учебного эксперимента с температурой генерации. "
-            "Сравни ровно три ответа на один и тот же запрос. Не считай более длинный ответ "
-            "автоматически лучшим. Если фактическую точность нельзя установить без внешней "
-            "проверки, прямо укажи это.\n\n"
-            "Разбери ответы по трём критериям:\n"
-            "1. Точность — корректность, конкретность, логические ошибки и необоснованные утверждения.\n"
-            "2. Креативность — оригинальность идей и формулировок без ущерба для смысла.\n"
-            "3. Разнообразие — широта подходов, примеров и вариантов внутри ответа.\n\n"
-            "Затем сформулируй, для каких задач лучше подходит каждая из использованных температур, "
-            "и дай короткий общий вывод. Используй понятные заголовки и обязательно ссылайся "
-            "на фактические различия между представленными ответами.\n\n"
-            f"Исходный запрос:\n{task}\n\n" + "\n\n".join(formatted_answers)
-        )
-        comparison_temperature = 0.0
-        result = call_model(
-            [{"role": "user", "content": judge_prompt}], comparison_temperature
-        )
-        return jsonify(
-            {
-                "ok": True,
-                **result_to_dict(result, comparison_temperature),
-                "comparison_temperature": comparison_temperature,
-            }
-        )
-    except ValueError as error:
-        return jsonify({"ok": False, "error": str(error)}), 400
-    except Exception as error:
-        app.logger.exception("Ошибка сравнения")
-        return jsonify({"ok": False, "error": friendly_api_error(error)}), 502
+def last_configuration(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for message in reversed(messages):
+        if message.get("role") == "user" and isinstance(message.get("technical"), dict):
+            return message["technical"]
+    return None
 
 
-@app.post("/api/save")
-def save_run():
-    try:
-        data = read_json_body()
-        task = require_text(data, "task", MAX_TASK_LENGTH)
-        results = validate_saved_results(data.get("results"))
-        comparison = validate_saved_comparison(data.get("comparison"))
-        created_at = str(data.get("created_at", ""))[:80]
-
-        now = datetime.now().astimezone()
-        run_id = f"{now:%Y-%m-%d_%H-%M-%S}_{uuid.uuid4().hex[:6]}"
-        run_dir = SAVED_RUNS_DIR / run_id
-        run_dir.mkdir(parents=True, exist_ok=False)
-
-        payload = {
-            "run_id": run_id,
-            "saved_at": now.isoformat(timespec="seconds"),
-            "created_at": created_at,
-            "task": task,
-            "model": DEFAULT_MODEL,
-            "reasoning_enabled": False,
-            "results": results,
-            "comparison": comparison,
-        }
-        (run_dir / "data.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        (run_dir / "report.html").write_text(
-            build_saved_report(payload), encoding="utf-8"
-        )
-        return jsonify(
-            {
-                "ok": True,
-                "run_id": run_id,
-                "folder": str(Path("saved_runs") / run_id),
-                "report_url": url_for("saved_report", run_id=run_id),
-            }
-        )
-    except (ValueError, OSError) as error:
-        app.logger.exception("Ошибка сохранения запуска")
-        return jsonify({"ok": False, "error": f"Не удалось сохранить запуск: {error}"}), 400
+def configuration_event_text(source: dict[str, Any]) -> str:
+    if source["type"] == "preset":
+        return f"Выбран пресет «{source['preset_name']}»."
+    if source["type"] == "preset_modified":
+        return f"Настройки пресета «{source['preset_name']}» изменены для следующего запроса."
+    return "Для следующего запроса выбраны разовые настройки."
 
 
-def validate_saved_results(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list) or not 1 <= len(value) <= 3:
-        raise ValueError("Для сохранения нужен хотя бы один результат из текущей пачки.")
-    cleaned = []
-    for item in value:
-        if not isinstance(item, dict):
-            raise ValueError("Неверный формат сохраняемых результатов.")
-        temperature = require_temperature(item.get("temperature"))
-        answer = str(item.get("answer", ""))[:MAX_ANSWER_LENGTH]
-        error = str(item.get("error", ""))[:2_000]
-        if not answer and not error:
-            raise ValueError("Сохраняемый результат не содержит ответа или ошибки.")
-        usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
-        cleaned.append(
-            {
-                "ok": bool(item.get("ok")),
-                "temperature": temperature,
-                "answer": answer,
-                "error": error,
-                "model": str(item.get("model", DEFAULT_MODEL))[:200],
-                "elapsed_seconds": item.get("elapsed_seconds", 0),
-                "usage": {
-                    key: int(usage.get(key, 0)) if str(usage.get(key, 0)).isdigit() else 0
-                    for key in ("input_tokens", "output_tokens", "total_tokens")
-                },
-            }
-        )
-    return cleaned
+def api_error(message: str, status: int):
+    return jsonify({"ok": False, "error": message}), status
 
 
-def validate_saved_comparison(value: Any) -> dict[str, Any] | None:
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise ValueError("Неверный формат сравнения.")
-    answer = str(value.get("answer", ""))[:MAX_ANSWER_LENGTH]
-    if not answer:
-        return None
-    return {
-        "answer": answer,
-        "temperature": 0,
-        "model": str(value.get("model", DEFAULT_MODEL))[:200],
-        "elapsed_seconds": value.get("elapsed_seconds", 0),
-        "usage": value.get("usage") if isinstance(value.get("usage"), dict) else {},
-    }
-
-
-@app.get("/saved")
-def saved_runs():
-    SAVED_RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    runs = []
-    for folder in sorted(SAVED_RUNS_DIR.iterdir(), reverse=True):
-        data_path = folder / "data.json"
-        if not folder.is_dir() or not data_path.is_file():
-            continue
-        try:
-            data = json.loads(data_path.read_text(encoding="utf-8"))
-            runs.append(
-                {
-                    "run_id": folder.name,
-                    "saved_at": data.get("saved_at", ""),
-                    "task": str(data.get("task", ""))[:180],
-                    "count": len(data.get("results", [])),
-                    "has_comparison": bool(data.get("comparison")),
-                }
-            )
-        except (OSError, json.JSONDecodeError):
-            continue
-    return render_template("saved_runs.html", runs=runs)
-
-
-@app.get("/saved/<run_id>")
-def saved_report(run_id: str):
-    if not RUN_ID_PATTERN.fullmatch(run_id):
-        return "Неверное имя сохранённого запуска.", 404
-    return send_from_directory(SAVED_RUNS_DIR / run_id, "report.html")
-
-
-def build_saved_report(payload: dict[str, Any]) -> str:
-    result_blocks = []
-    for index, result in enumerate(payload["results"], start=1):
-        body = result["answer"] if result["ok"] else f"Ошибка: {result['error']}"
-        usage = result["usage"]
-        result_blocks.append(
-            "<article><h2>"
-            f"Ответ {index} · temperature = {result['temperature']:g}"
-            "</h2><div class=\"meta\">"
-            f"{html.escape(result['model'])} · {html.escape(str(result['elapsed_seconds']))} сек. · "
-            f"{usage.get('total_tokens', 0)} токенов</div>"
-            f"<div class=\"text\">{html.escape(body)}</div></article>"
-        )
-    comparison = payload.get("comparison")
-    comparison_block = ""
-    if comparison:
-        comparison_block = (
-            "<article class=\"comparison\"><h2>Сравнение трёх ответов</h2>"
-            "<div class=\"meta\">Температура проверяющего: 0</div>"
-            f"<div class=\"text\">{html.escape(comparison['answer'])}</div></article>"
-        )
-    return f"""<!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Сохранённый запуск {html.escape(payload['run_id'])}</title>
-<style>
-body{{margin:0;background:#04110e;color:#f8fafc;font:16px/1.65 system-ui,sans-serif}}main{{width:min(1100px,calc(100% - 32px));margin:48px auto 80px}}a{{color:#6ee7b7}}h1{{line-height:1.15}}.meta{{color:#91b3a8;font-size:13px}}.notice{{padding:12px 16px;border:1px solid #a3e635;border-radius:12px;color:#d9f99d;background:#16220b}}article,.task{{margin-top:20px;padding:24px;border:1px solid rgba(110,231,183,.18);border-radius:18px;background:#0b211b}}.text{{margin-top:16px;color:#d1fae5;white-space:pre-wrap;overflow-wrap:anywhere}}.comparison{{border-color:#2dd4bf}}small{{color:#91b3a8}}
-</style></head><body><main>
-<p><a href="/saved">← Все сохранённые запуски</a></p>
-<h1>Эксперимент с температурой</h1>
-<p class="notice"><strong>Reasoning выключен.</strong> Это необходимо, чтобы настройка температуры применялась.</p>
-<small>Сохранено: {html.escape(payload['saved_at'])} · Модель: {html.escape(payload['model'])}</small>
-<section class="task"><strong>Исходный запрос</strong><div class="text">{html.escape(payload['task'])}</div></section>
-{''.join(result_blocks)}{comparison_block}
-</main></body></html>"""
+def with_token_totals(conversation: dict[str, Any]) -> dict[str, Any]:
+    """Добавляет вычисляемые представления, не изменяя сохранённый оригинал."""
+    result = deepcopy(conversation)
+    ensure_context_management(result)
+    result["token_totals"] = dialogue_token_totals(result.get("messages", []))
+    visible = active_path_messages(result)
+    result["visible_messages"] = visible
+    result["active_path_token_totals"] = dialogue_token_totals(visible)
+    result["branch_points"] = branch_points(result)
+    result["summary_token_totals"] = summary_token_totals(result.get("summaries", []))
+    result["facts_token_totals"] = facts_token_totals(result.get("fact_revisions", []))
+    return result
 
 
 def friendly_api_error(error: Exception) -> str:
     text = str(error)
     lowered = text.lower()
+    context_markers = (
+        "context length",
+        "context_length",
+        "maximum context",
+        "max context",
+        "too many tokens",
+        "token limit",
+    )
+    if any(marker in lowered for marker in context_markers):
+        return (
+            "Контекст диалога превысил лимит модели. "
+            "Создайте новый диалог или сократите историю и повторите запрос."
+        )
     if "api key" in lowered or "authentication" in lowered or "401" in lowered:
         return "DeepSeek отклонил API-ключ. Проверьте DEEPSEEK_API_KEY в файле .env."
     if "429" in lowered or "rate limit" in lowered:
@@ -355,11 +517,11 @@ def friendly_api_error(error: Exception) -> str:
     if "timeout" in lowered or "timed out" in lowered:
         return "DeepSeek не успел ответить. Повторите запрос."
     if "connection" in lowered or "connect" in lowered or "network" in lowered:
-        return (
-            "Не удалось установить соединение с DeepSeek. Проверьте интернет, VPN или прокси, "
-            "затем перезапустите локальный сервер и повторите запрос."
-        )
+        return "Не удалось соединиться с DeepSeek. Проверьте интернет, VPN или прокси."
     return f"Не удалось получить ответ DeepSeek: {text}"
+
+
+app = create_app()
 
 
 if __name__ == "__main__":

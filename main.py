@@ -1,4 +1,4 @@
-"""Простой запуск веб-приложения с автоматическим открытием браузера."""
+"""Запуск DeepSeek Agent с автоматическим открытием браузера."""
 
 import threading
 import webbrowser
@@ -29,6 +29,9 @@ if __name__ == "__main__":
     threading.Timer(1.0, open_browser, args=(url,)).start()
     if port != 5000:
         print(f"Порт 5000 занят другой программой. Используется свободный порт {port}.")
-    print(f"DeepSeek Temperature Lab запущен: {url}")
+    print(f"DeepSeek Agent запущен: {url}")
     print("Чтобы остановить сервер, нажмите Ctrl+C.\n")
-    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
+    try:
+        app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
+    finally:
+        app.extensions["whisper_service"].stop()

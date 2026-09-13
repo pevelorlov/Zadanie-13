@@ -3,179 +3,165 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Сравнение ответов DeepSeek при трёх температурах">
-  <title>DeepSeek Temperature Lab</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <meta name="description" content="Локальный многодиалоговый агент DeepSeek">
+  <title>DeepSeek Agent</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='20260912-10') }}">
 </head>
 <body>
-  <div class="ambient ambient-one"></div>
-  <div class="ambient ambient-two"></div>
-
-  <main class="page-shell">
-    <header class="hero compact-hero">
-      <div>
-        <div class="eyebrow"><span class="pulse"></span> TEMPERATURE LAB</div>
-        <h1>Один запрос. <span>Три температуры.</span></h1>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">D</span><div><strong>DeepSeek Agent</strong><small>Локальная история JSON</small></div></div>
+      <button id="new-chat" class="primary wide" type="button">＋ Новый диалог</button>
+      <div class="sidebar-heading"><span>Диалоги</span><button id="import-button" class="icon-button" title="Импортировать JSON">⇧</button></div>
+      <input id="import-file" type="file" accept="application/json,.json" hidden>
+      <nav id="conversation-list" class="conversation-list" aria-label="Диалоги"></nav>
+      <div class="sidebar-footer">
+        <button id="presets-button" class="secondary wide" type="button">Управление пресетами</button>
+        <small>Ключ хранится только в .env</small>
       </div>
-      <div class="header-tools">
-        <a class="saved-link" href="{{ url_for('saved_runs') }}">Сохранённые запуски</a>
-        <div class="model-chip" title="Модель задаётся переменной DEEPSEEK_MODEL в .env">
-          <span>Модель</span>
-          <strong>{{ model }}</strong>
-        </div>
-      </div>
-    </header>
-
-    <aside class="reasoning-notice" role="note">
-      <strong>Reasoning выключен</strong>
-      <span>DeepSeek игнорирует настройку temperature в режиме Thinking, поэтому все ответы и сравнение выполняются без Reasoning.</span>
     </aside>
 
-    <form id="solver-form" novalidate>
-      <section class="task-panel glass-panel">
-        <div class="section-heading">
-          <div>
-            <span class="section-index">01</span>
-            <h2>Введите один запрос</h2>
-          </div>
-          <button class="text-button" type="button" id="example-button">Подставить пример</button>
-        </div>
-        <div class="task-workspace">
-          <div class="task-field">
-            <textarea id="task" maxlength="20000" required placeholder="Например: Придумай три необычных концепции кафе для небольшого сибирского города."></textarea>
-            <div class="field-footer">
-              <span>Один и тот же текст будет отправлен три раза</span>
-              <span><b id="task-count">0</b> / 20 000</span>
-            </div>
-          </div>
-          <div class="task-actions">
-            <button class="launch-button" id="launch-button" type="submit">
-              <span class="button-icon">▶</span>
-              <span class="button-label">Запустить 3 температуры</span>
-            </button>
-            <p>Сравнение не запускается автоматически. Оно доступно отдельно у каждой готовой пачки.</p>
-          </div>
-        </div>
-        <p id="form-error" class="form-error" role="alert"></p>
-      </section>
-
-      <section class="methods-section">
-        <div class="section-heading outside-heading">
-          <div>
-            <span class="section-index">02</span>
-            <h2>Настройте температуры</h2>
-          </div>
-          <p>Допустимый диапазон: от 0 до 2</p>
-        </div>
-
-        <div class="method-grid temperature-grid">
-          <article class="method-card accent-blue">
-            <span class="method-number">01</span>
-            <h3>Точный режим</h3>
-            <p>Минимум случайности: ответы обычно стабильнее и строже.</p>
-            <div class="temperature-control">
-              <div class="temperature-readout"><span>temperature</span><output for="temperature-slider-1">0</output></div>
-              <input class="temperature-slider" id="temperature-slider-1" type="range" min="0" max="2" step="0.01" value="0" aria-label="Ползунок первой температуры">
-              <div class="range-scale"><span>0</span><span>2</span></div>
-              <label class="temperature-label" for="temperature-1">Точное значение</label>
-              <input class="temperature-input" id="temperature-1" type="number" min="0" max="2" step="0.01" value="0" required>
-            </div>
-          </article>
-
-          <article class="method-card accent-violet">
-            <span class="method-number">02</span>
-            <h3>Сбалансированный режим</h3>
-            <p>Умеренная вариативность без слишком сильной случайности.</p>
-            <div class="temperature-control">
-              <div class="temperature-readout"><span>temperature</span><output for="temperature-slider-2">0,7</output></div>
-              <input class="temperature-slider" id="temperature-slider-2" type="range" min="0" max="2" step="0.01" value="0.7" aria-label="Ползунок второй температуры">
-              <div class="range-scale"><span>0</span><span>2</span></div>
-              <label class="temperature-label" for="temperature-2">Точное значение</label>
-              <input class="temperature-input" id="temperature-2" type="number" min="0" max="2" step="0.01" value="0.7" required>
-            </div>
-          </article>
-
-          <article class="method-card accent-orange">
-            <span class="method-number">03</span>
-            <h3>Творческий режим</h3>
-            <p>Больше неожиданных формулировок, идей и разнообразия.</p>
-            <div class="temperature-control">
-              <div class="temperature-readout"><span>temperature</span><output for="temperature-slider-3">1,2</output></div>
-              <input class="temperature-slider" id="temperature-slider-3" type="range" min="0" max="2" step="0.01" value="1.2" aria-label="Ползунок третьей температуры">
-              <div class="range-scale"><span>0</span><span>2</span></div>
-              <label class="temperature-label" for="temperature-3">Точное значение</label>
-              <input class="temperature-input" id="temperature-3" type="number" min="0" max="2" step="0.01" value="1.2" required>
-            </div>
-          </article>
-        </div>
-      </section>
-    </form>
-
-    <section id="results-section" class="results-section" hidden>
-      <div class="section-heading outside-heading">
+    <main class="chat-panel">
+      <header class="chat-header">
         <div>
-          <span class="section-index">03</span>
-          <h2>История запусков</h2>
+          <input id="chat-title" class="title-input" value="Новый диалог" maxlength="120" aria-label="Название диалога">
+          <div id="chat-subtitle" class="subtitle">DeepSeek · история сохраняется автоматически</div>
+          <div id="token-overview" class="token-overview" aria-label="Накопленные токены диалога" hidden></div>
         </div>
-        <p>Новые пачки появляются сверху</p>
-      </div>
-      <div id="run-history" class="run-history"></div>
-    </section>
-  </main>
-
-  <template id="run-template">
-    <article class="run-batch glass-panel">
-      <header class="batch-header">
-        <div>
-          <span class="batch-kicker">ПАЧКА ИЗ ТРЁХ ОТВЕТОВ</span>
-          <h2 class="batch-title"></h2>
-          <p class="batch-task"></p>
-        </div>
-        <div class="batch-actions">
-          <span class="batch-progress">Выполняется: 0 из 3</span>
-          <button class="secondary-button compare-button" type="button" disabled>Сравнить три ответа</button>
-          <button class="secondary-button save-button" type="button" disabled>Сохранить пачку</button>
+        <div class="header-actions">
+          <button id="export-button" class="secondary" type="button">Экспорт JSON</button>
+          <button id="delete-chat" class="danger" type="button">Удалить</button>
         </div>
       </header>
-      <div class="result-grid"></div>
-      <p class="batch-message" role="status"></p>
-      <article class="comparison-card" hidden>
-        <div class="comparison-heading">
-          <div>
-            <span class="comparison-kicker">РУЧНОЙ АНАЛИЗ</span>
-            <h2>Сравнение ответов</h2>
-          </div>
-          <span class="judge-badge">temperature = 0 · Reasoning выключен</span>
-        </div>
-        <div class="comparison-status"></div>
-        <div class="comparison-answer answer-text"></div>
-        <p class="comparison-note">Оценка выполнена моделью, а не эталонным проверяющим. Фактические утверждения следует проверять отдельно.</p>
-      </article>
-    </article>
-  </template>
 
-  <template id="result-template">
-    <article class="result-card">
-      <div class="result-header">
-        <div>
-          <span class="result-number"></span>
-          <h3 class="result-title"></h3>
+      <section id="messages" class="messages" aria-live="polite">
+        <div class="welcome">
+          <span class="welcome-mark">D</span>
+          <h1>Первый агент готов к диалогу</h1>
+          <p>Выберите пресет или настройте один запрос вручную. Контекст и технические данные сохраняются после каждого сообщения.</p>
         </div>
-        <span class="status-badge">Ожидание</span>
-      </div>
-      <div class="loading-state">
-        <span class="loader"></span>
-        <p>DeepSeek формирует ответ…</p>
-      </div>
-      <div class="result-content" hidden>
-        <div class="answer-text"></div>
-        <div class="result-meta"></div>
-        <button class="copy-button" type="button">Копировать ответ</button>
-      </div>
-      <div class="error-state" hidden></div>
-    </article>
-  </template>
+      </section>
 
-  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+      <section class="composer-area">
+        <div class="configuration-bar">
+          <label>Конфигурация
+            <select id="preset-select"><option value="">Разовые настройки</option></select>
+          </label>
+          <button id="settings-toggle" class="secondary" type="button">Настройки запроса</button>
+          <span id="settings-summary" class="settings-summary"></span>
+          <span id="request-status" class="request-status" role="status" hidden><i></i> Запрос отправлен · ожидаем DeepSeek</span>
+        </div>
+        <form id="message-form" class="composer">
+          <textarea id="message-input" maxlength="50000" rows="1" placeholder="Напишите сообщение…" required></textarea>
+          <button id="voice-button" class="voice-button" type="button" title="Надиктовать сообщение" aria-label="Надиктовать сообщение" disabled>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V22h2v-3.08A7 7 0 0 0 19 12h-2Z"/></svg>
+          </button>
+          <button id="send-button" class="send-button" type="submit" title="Отправить">↑</button>
+        </form>
+        <div class="composer-foot"><span><span id="voice-status" class="voice-status">Whisper запускается…</span><span id="form-error" role="alert"></span></span><span>Enter — отправить · Shift+Enter — новая строка</span></div>
+      </section>
+    </main>
+
+    <aside class="context-panel" aria-label="Управление контекстом">
+      <div class="context-heading">
+        <div><small>ДЕНЬ 10</small><h2>Контекст</h2></div>
+        <span id="context-status" class="context-status">Полная история</span>
+      </div>
+      <div class="context-scroll">
+        <label class="context-mode-label">Режим этого диалога
+          <select id="context-mode">
+            <option value="full">Полная история</option>
+            <option value="summary">Summary + последние обмены</option>
+            <option value="sliding">Sliding Window</option>
+            <option value="facts">Sticky Facts</option>
+            <option value="branching">Branching</option>
+          </select>
+        </label>
+        <label id="window-setting" class="context-mode-label" hidden>Последние обмены (1–50)
+          <input id="window-exchanges" type="number" min="1" max="50" step="1" value="5">
+        </label>
+        <div id="context-rule" class="context-rule">
+          <strong>Правило стратегии</strong>
+          <span id="context-rule-text">В запрос отправляется вся успешная история активного пути.</span>
+        </div>
+        <div id="context-metrics" class="context-metrics"></div>
+        <section id="summary-section" class="summary-current">
+          <div class="section-title"><strong>Действующий summary</strong><small id="summary-current-meta"></small></div>
+          <div id="summary-current" class="summary-text">Summary ещё не создан.</div>
+        </section>
+        <section id="summary-history-section">
+          <div class="section-title"><strong>История summary</strong><small id="summary-count">0 версий</small></div>
+          <div id="summary-history" class="summary-history"></div>
+        </section>
+        <section id="facts-section" hidden>
+          <div class="section-title"><strong>Sticky Facts</strong><small id="facts-count">0 фактов</small></div>
+          <div id="facts-list" class="facts-list"></div>
+          <form id="fact-form" class="fact-form">
+            <input id="fact-key" maxlength="120" placeholder="goal.primary" required>
+            <textarea id="fact-value" maxlength="2000" rows="2" placeholder="Значение" required></textarea>
+            <button class="secondary" type="submit">Добавить и закрепить</button>
+          </form>
+          <p id="facts-error" class="error-text"></p>
+        </section>
+        <section id="branching-section" hidden>
+          <div class="section-title"><strong>Ветки</strong><small id="branch-count">1 путь</small></div>
+          <p class="branch-help">Нажмите «Разветвить» после любого сообщения. Переключатели 1/N появятся возле точки разделения.</p>
+        </section>
+      </div>
+      <p class="context-foot">Полные сообщения, ветки, facts и версии summary сохраняются вместе в JSON диалога.</p>
+    </aside>
+
+    <aside id="settings-panel" class="settings-panel" aria-label="Настройки запроса">
+      <div class="panel-heading"><div><small>ДЛЯ СЛЕДУЮЩЕГО ЗАПРОСА</small><h2>Настройки агента</h2></div><button id="settings-close" class="icon-button">×</button></div>
+      <div class="settings-scroll">
+        <label>Модель<select id="setting-model"></select></label>
+        <label>Системный промпт<textarea id="setting-system" rows="6" maxlength="20000"></textarea></label>
+        <div class="two-columns">
+          <label>Temperature<input id="setting-temperature" type="number" min="0" max="2" step="0.01"></label>
+          <label>Top P<input id="setting-top-p" type="number" min="0" max="1" step="0.01"></label>
+        </div>
+        <label>Reasoning
+          <select id="setting-reasoning">
+            <option value="false">Нет — выключен</option>
+            <option value="true">Да — включён</option>
+          </select>
+          <small>Рассуждения сохраняются отдельно и раскрываются по запросу</small>
+        </label>
+        <label>Усилие рассуждения<select id="setting-effort"><option>low</option><option>high</option><option>max</option></select></label>
+        <label>Максимум токенов <small>(необязательно)</small><input id="setting-max-tokens" type="number" min="1" max="65536" placeholder="По умолчанию API"></label>
+        <label>Стоп-последовательности <small>(по одной в строке)</small><textarea id="setting-stop" rows="3"></textarea></label>
+        <label>Формат ответа<select id="setting-format"><option value="text">Обычный текст</option><option value="json_object">JSON-объект</option></select></label>
+        <label class="toggle-row"><span><strong>Logprobs</strong><small>Вероятности токенов</small></span><input id="setting-logprobs" type="checkbox"></label>
+        <label>Top logprobs <small>(необязательно)</small><input id="setting-top-logprobs" type="number" min="0" max="20" placeholder="0–20"></label>
+      </div>
+      <div class="panel-actions"><button id="reset-custom" class="secondary" type="button">Сбросить</button><button id="save-as-preset" class="primary" type="button">Сохранить как пресет</button></div>
+    </aside>
+  </div>
+
+  <dialog id="preset-dialog">
+    <form method="dialog" class="dialog-card" id="preset-form">
+      <div class="panel-heading"><div><small>БИБЛИОТЕКА</small><h2>Пресеты</h2></div><button class="icon-button" value="cancel">×</button></div>
+      <div id="preset-list" class="preset-list"></div>
+      <div class="preset-editor">
+        <h3 id="preset-editor-title">Новый пресет из текущих настроек</h3>
+        <input id="preset-name" maxlength="80" placeholder="Название, например Технический специалист">
+        <textarea id="preset-description" maxlength="500" rows="2" placeholder="Короткое описание"></textarea>
+        <label class="preset-reasoning-label">Reasoning в пресете
+          <select id="preset-reasoning">
+            <option value="false">Нет — выключен</option>
+            <option value="true">Да — включён</option>
+          </select>
+        </label>
+        <input id="preset-edit-id" type="hidden">
+        <div class="dialog-actions"><button id="preset-cancel-edit" class="secondary" type="button">Очистить</button><button id="preset-save" class="primary" type="button">Сохранить</button></div>
+        <p id="preset-error" class="error-text"></p>
+      </div>
+    </form>
+  </dialog>
+
+  <template id="message-template">
+    <article class="message"><div class="message-avatar"></div><div class="message-body"><header><strong></strong><time></time></header><div class="message-text"></div><div class="message-actions"><button class="fork-button" type="button">Разветвить</button><div class="branch-switch" hidden><button class="branch-prev" type="button" aria-label="Предыдущая ветка">‹</button><span></span><button class="branch-next" type="button" aria-label="Следующая ветка">›</button></div></div><div class="token-strip" hidden></div><details class="reasoning" hidden><summary>Ход рассуждений</summary><div></div></details><details class="technical"><summary>Техническая информация</summary><pre></pre></details></div></article>
+  </template>
+  <script src="{{ url_for('static', filename='app.js', v='20260912-10') }}"></script>
 </body>
 </html>

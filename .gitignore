@@ -1,4 +1,10 @@
 .env
 .venv/
 __pycache__/
-saved_runs/*/
+data/
+models/
+tools/downloads/
+tools/ffmpeg/
+tools/whisper/source/
+tools/whisper/build-vulkan/
+tools/whisper/bin/
